@@ -31,11 +31,13 @@ def analyze_patch_grid(gray_array, patch_size):
 
 def process_cr3_file(file_path: Path):
     print(f"Analyzing: {file_path.name} ... ", end='', flush=True)
+    
+    # Create report path exactly next to the source file
     report_path = file_path.with_suffix('.txt')
     
     try:
         with rawpy.imread(str(file_path)) as raw:
-            # Extract linear 16-bit data without AWB and gamma
+            # Extract linear 16-bit data without AWB and gamma (values 0 - 65535)
             rgb_linear = raw.postprocess(
                 gamma=(1, 1), 
                 no_auto_bright=True, 
@@ -67,10 +69,16 @@ def process_cr3_file(file_path: Path):
         awb_rec = f"Recommended Multipliers (Gain): R={wb_k_r:.3f}, G=1.000, B={wb_k_b:.3f}"
 
     # 3. Convert to Grayscale (luminance) for spatial analysis
-    # Canonical luminance coefficients
+    # Canonical luminance coefficients applied to the 16-bit data
     gray_array = (0.2126 * rgb_linear[:, :, 0] + 
                   0.7152 * rgb_linear[:, :, 1] + 
                   0.0722 * rgb_linear[:, :, 2]).astype(np.float32)
+
+    # --- CRITICAL SCALE FIX ---
+    # Normalize 16-bit scale (0-65535) down to 8-bit scale (0-255)
+    # This aligns the mathematical variance with our standard threshold limits
+    gray_array = (gray_array / 65535.0) * 255.0
+    # --------------------------
 
     # 4. Analyze 512x512 patches
     t_512, g_512, y_512, var_512 = analyze_patch_grid(gray_array, 512)
@@ -81,7 +89,7 @@ def process_cr3_file(file_path: Path):
     # 6. Noise Floor Estimation
     # Take the 5th percentile of variance (the flattest, non-textured areas)
     # Their variance represents the pure physical sensor noise
-    noise_floor = np.percentile(var_512, 5)
+    noise_floor = np.percentile(var_512, 5) if len(var_512) > 0 else 0
 
     # --- REJECTION LOGIC ---
     is_rejected = False
@@ -125,7 +133,7 @@ def process_cr3_file(file_path: Path):
     report.append(f"  Total patches   : {t_512}")
     report.append(f"  Useful patches  : {g_512} (Var > {VAR_THRESHOLD})")
     report.append(f"  Grid efficiency : {y_512:.1f}%")
-    report.append(f"  Peak sharpness  : {np.max(var_512):.0f}")
+    report.append(f"  Peak sharpness  : {np.max(var_512):.0f}" if len(var_512) > 0 else "  Peak sharpness  : 0")
     
     report.append("\nGRID 1024x1024 (Stride 512):")
     report.append(f"  Total patches   : {t_1024}")
