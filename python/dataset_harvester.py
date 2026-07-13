@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+#
+# pip install numpy rawpy pillow
+#
 """
 Dataset harvester for NN image-restoration training (denoise / AWB / sharpness).
 
@@ -39,7 +42,10 @@ Card mode usage:
   an addendum per line -- measured mean R, G, B of the card (linear camera
   space, 0-1), the derived gains, and validity flags.
 
-Requires: rawpy, numpy, scipy, Pillow (only for -png previews).
+Platform contract: Windows 10/11 x64, Python 3.12 (64-bit).
+Requires: numpy, rawpy, Pillow (Pillow only for -png previews).
+All available as prebuilt win_amd64 wheels: pip install numpy rawpy pillow
+No OpenCV / scipy / torch or other heavy frameworks are used.
 """
 
 import argparse
@@ -50,7 +56,6 @@ from pathlib import Path
 
 import numpy as np
 import rawpy
-from scipy.ndimage import convolve
 
 # --- CONFIGURATION -----------------------------------------------------------
 PATCHES_PER_STRATUM = {"detail": 3, "mid": 2, "flat": 2}
@@ -80,17 +85,35 @@ LAPLACE_KERNEL = np.array([[0,  1, 0],
 
 # --- METRICS -----------------------------------------------------------------
 
+def conv3x3(img: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    """
+    3x3 convolution in pure NumPy, replacing scipy.ndimage.convolve to keep
+    dependencies minimal. np.pad mode="symmetric" == scipy's "reflect"
+    boundary (edge pixel duplicated). Both kernels used here are 180-degree
+    symmetric, so convolution and correlation coincide.
+    """
+    p = np.pad(img, 1, mode="symmetric")
+    out = np.zeros(img.shape, dtype=np.float32)
+    hh, ww = img.shape
+    for i in range(3):
+        for j in range(3):
+            k = kernel[i, j]
+            if k != 0.0:
+                out += k * p[i:i + hh, j:j + ww]
+    return out
+
+
 def estimate_noise_sigma(gray: np.ndarray) -> float:
     """Immerkaer fast noise sigma estimate on a grayscale patch (linear)."""
     h, w = gray.shape
-    resp = convolve(gray, IMMERKAER_KERNEL, mode="reflect")
+    resp = conv3x3(gray, IMMERKAER_KERNEL)
     return float(math.sqrt(math.pi / 2.0) * np.abs(resp).sum()
                  / (6.0 * (w - 2) * (h - 2)))
 
 
 def sharpness_metric(gray: np.ndarray) -> float:
     """Laplacian variance. Only meaningful AFTER the noise gate has passed."""
-    return float(convolve(gray, LAPLACE_KERNEL, mode="reflect").var())
+    return float(conv3x3(gray, LAPLACE_KERNEL).var())
 
 
 # --- GRAY-CARD MEASUREMENT ---------------------------------------------------
