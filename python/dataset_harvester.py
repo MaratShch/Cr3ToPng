@@ -68,7 +68,9 @@ No OpenCV / scipy / torch or other heavy frameworks are used.
 import argparse
 import json
 import math
+import platform
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -394,6 +396,9 @@ def analyze_and_harvest(cr3_path: Path, output_dir: Path, save_png: bool,
                                            initial_taken=manual)
 
     report = {
+        "report_created": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "operating_system": f"{platform.system()} {platform.release()} "
+                            f"({platform.machine()}), Python {platform.python_version()}",
         "source": cr3_path.name,
         "reference_wb": {
             "tier": "gold" if meas else "silver",
@@ -423,7 +428,7 @@ def analyze_and_harvest(cr3_path: Path, output_dir: Path, save_png: bool,
             entry["gate_flags"] = p["gate_flags"]
         report["patches"].append(entry)
 
-    with open(output_dir / f"{cr3_path.stem}_report.json", "w") as f:
+    with open(output_dir / f"{cr3_path.stem}.json", "w") as f:
         json.dump(report, f, indent=2)
 
     print(f"  [OK] {len(selection)} patches "
