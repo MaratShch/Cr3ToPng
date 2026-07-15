@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-#
-# pip install numpy rawpy pillow
-#
 """
 Dataset harvester for NN image-restoration training (denoise / AWB / sharpness).
 
@@ -42,6 +39,26 @@ Card mode usage:
   an addendum per line -- measured mean R, G, B of the card (linear camera
   space, 0-1), the derived gains, and validity flags.
 
+Manual slice mode (automatic, no option needed):
+  The script ALWAYS looks for a file named  data_harvest.txt  in the input
+  folder (the folder given on the command line, or the parent folder of a
+  single given CR3 file) and reports in the terminal whether it was found.
+  If found, its slices are harvested as an ADDENDUM to the automatic
+  harvesting -- manual slices never replace or reduce the automatic
+  selection; the automatic picks merely avoid overlapping them.
+  File format, one line per manual slice (a frame may appear on several
+  lines):
+      <CR3 image name>, <x>, <y>
+  where (x, y) is the TOP-LEFT corner of the slice, x = horizontal, in
+  full-frame pixels; slice size = --size. Manual slices bypass the quality
+  gates (the user has decided), but their quality metrics (sharpness, std,
+  noise, brightness) are measured and written into the same JSON report as
+  automatic patches, with stratum "manual" plus gate flags if a metric is
+  out of the automatic-selection limits; -png previews are written for
+  them exactly like for automatic patches. If a point is out of frame (too
+  low / too far right so a full slice cannot be clipped), the point is
+  IGNORED with a terminal warning.
+
 Platform contract: Windows 10/11 x64, Python 3.12 (64-bit).
 Requires: numpy, rawpy, Pillow (Pillow only for -png previews).
 All available as prebuilt win_amd64 wheels: pip install numpy rawpy pillow
@@ -67,10 +84,29 @@ MIN_BRIGHTNESS = 0.06
 # Tune against a known-clean base-ISO frame of your camera.
 MAX_NOISE_SIGMA = 0.004
 
+# --- Absolute stratum eligibility gates (linear 0-1 units) -------------------
+# Strata terciles are RELATIVE to each frame; these gates are ABSOLUTE, so a
+# stratum may legitimately come up EMPTY on a frame lacking suitable content
+# (e.g. a shallow-DOF close-up has no true flat surfaces). That is intended.
+#
+# 'flat' must be STATISTICALLY flat: low overall std rejects defocused texture
+# (bokeh fur/skin), which is edge-free but full of shading gradients. Blur also
+# suppresses noise, so without this gate the lowest-noise ranking would
+# actively PREFER missed-focus regions.
+FLAT_MAX_STD = 0.015
+# 'detail' must be genuinely sharp in absolute terms, so a fully defocused
+# frame cannot promote blur into the detail stratum via relative terciles.
+# Calibrate: run on one known in-focus frame and one missed-focus frame,
+# compare reported sharpness values, set the floor between them.
+DETAIL_MIN_SHARPNESS = 1e-5
+
 # Card-measurement validity limits (linear 0-1, camera space):
 CARD_CLIP_LEVEL = 0.98    # any channel mean above this -> clipped, untrusted
 CARD_FLOOR_LEVEL = 0.02   # any channel mean below this -> noise floor, untrusted
 CARD_EDGE_TRIM = 0.20     # fraction of region trimmed on each side before averaging
+
+# Manual-slice file, auto-discovered in the input folder (no CLI option):
+MANUAL_FILE_NAME = "data_harvest.txt"
 
 LUMA = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)  # Rec.709, linear
 
@@ -224,6 +260,7 @@ def collect_candidates(rgb, gray, patch_size, exclude_region=None):
             candidates.append({
                 "y": y, "x": x,
                 "brightness": brightness,
+                "std": float(p_gray.std()),
                 "noise_sigma": sigma,
                 "sharpness": sharpness_metric(p_gray),
             })
@@ -243,24 +280,35 @@ def nms_select(sorted_cands, k, min_dist, taken):
     return picked
 
 
-def stratified_select(candidates, patch_size):
-    """detail / mid / flat by sharpness terciles + non-overlap NMS.
-    Flat stratum ranked by LOWEST noise (its merit is cleanliness)."""
+def stratified_select(candidates, patch_size, initial_taken=None):
+    """detail / mid / flat by sharpness terciles + ABSOLUTE eligibility gates
+    + non-overlap NMS. Strata may return fewer patches than their quota (or
+    none) when the frame lacks suitable content -- intended behavior.
+    Flat stratum ranked by LOWEST noise among statistically flat patches.
+    initial_taken: positions (e.g. manual slices) automatic picks must avoid."""
     if not candidates:
         return []
     sharp = np.array([c["sharpness"] for c in candidates])
     t_low, t_high = np.percentile(sharp, [33.3, 66.6])
     strata = {
-        "detail": sorted((c for c in candidates if c["sharpness"] >= t_high),
+        "detail": sorted((c for c in candidates
+                          if c["sharpness"] >= max(t_high, DETAIL_MIN_SHARPNESS)),
                          key=lambda c: c["sharpness"], reverse=True),
-        "mid":    sorted((c for c in candidates if t_low <= c["sharpness"] < t_high),
+        "mid":    sorted((c for c in candidates
+                          if t_low <= c["sharpness"] < t_high),
                          key=lambda c: c["sharpness"], reverse=True),
-        "flat":   sorted((c for c in candidates if c["sharpness"] < t_low),
+        "flat":   sorted((c for c in candidates
+                          if c["sharpness"] < t_low and c["std"] <= FLAT_MAX_STD),
                          key=lambda c: c["noise_sigma"]),
     }
-    taken, selection = [], []
+    taken = list(initial_taken) if initial_taken else []
+    selection = []
     for name, cands in strata.items():
-        for p in nms_select(cands, PATCHES_PER_STRATUM[name], patch_size, taken):
+        picked = nms_select(cands, PATCHES_PER_STRATUM[name], patch_size, taken)
+        if len(picked) < PATCHES_PER_STRATUM[name]:
+            print(f"  [INFO] stratum '{name}': {len(picked)}/"
+                  f"{PATCHES_PER_STRATUM[name]} -- frame lacks eligible content")
+        for p in picked:
             p["stratum"] = name
             selection.append(p)
     return selection
@@ -274,8 +322,44 @@ def save_preview_png(patch_lin: np.ndarray, path: Path):
     Image.fromarray((srgb * 255.0 + 0.5).astype(np.uint8)).save(path)
 
 
+def measure_manual_slices(rgb, gray, points, patch_size, frame_name):
+    """
+    Validate and measure user-chosen slices. Out-of-frame points are ignored
+    with a terminal warning. Quality gates are NOT applied (user's decision),
+    but out-of-limit metrics are flagged in the report.
+    """
+    H, W = gray.shape
+    manual = []
+    for (x, y) in points:
+        if not (0 <= x and x + patch_size <= W and 0 <= y and y + patch_size <= H):
+            print(f"  [WARN] {frame_name}: manual point (x={x}, y={y}) ignored -- "
+                  f"a {patch_size}x{patch_size} slice does not fit the "
+                  f"{W}x{H} frame")
+            continue
+        p_gray = gray[y:y + patch_size, x:x + patch_size]
+        entry = {
+            "y": y, "x": x,
+            "brightness": float(p_gray.mean()),
+            "std": float(p_gray.std()),
+            "noise_sigma": estimate_noise_sigma(p_gray),
+            "sharpness": sharpness_metric(p_gray),
+            "stratum": "manual",
+        }
+        flags = []
+        if entry["brightness"] < MIN_BRIGHTNESS:
+            flags.append("DARK")
+        if entry["noise_sigma"] > MAX_NOISE_SIGMA:
+            flags.append("NOISY")
+        entry["gate_flags"] = flags
+        if flags:
+            print(f"  [WARN] {frame_name}: manual slice (x={x}, y={y}) kept, "
+                  f"but out of automatic limits: {'|'.join(flags)}")
+        manual.append(entry)
+    return manual
+
+
 def analyze_and_harvest(cr3_path: Path, output_dir: Path, save_png: bool,
-                        patch_size: int, wb: dict):
+                        patch_size: int, wb: dict, manual_points=None):
     """
     wb: {"source": "as_shot" | "card_measured" | "card_inherited",
          "measurement": card dict or None}
@@ -301,8 +385,13 @@ def analyze_and_harvest(cr3_path: Path, output_dir: Path, save_png: bool,
         exclude = meas["region_xywh"]  # the card itself must not become a patch
 
     frame_noise = estimate_noise_sigma(gray)
+
+    manual = measure_manual_slices(rgb, gray, manual_points or [],
+                                   patch_size, cr3_path.name)
+
     candidates = collect_candidates(rgb, gray, patch_size, exclude_region=exclude)
-    selection = stratified_select(candidates, patch_size)
+    selection = manual + stratified_select(candidates, patch_size,
+                                           initial_taken=manual)
 
     report = {
         "source": cr3_path.name,
@@ -323,12 +412,16 @@ def analyze_and_harvest(cr3_path: Path, output_dir: Path, save_png: bool,
         np.save(gt_dir / f"{pid}.npy", patch.astype(np.float16))
         if save_png:
             save_preview_png(patch, gt_dir / f"{pid}_preview.png")
-        report["patches"].append({
+        entry = {
             "id": pid, "y": p["y"], "x": p["x"], "stratum": p["stratum"],
             "sharpness": round(p["sharpness"], 6),
+            "std": round(p["std"], 6),
             "noise_sigma": round(p["noise_sigma"], 6),
             "brightness": round(p["brightness"], 4),
-        })
+        }
+        if p.get("gate_flags"):
+            entry["gate_flags"] = p["gate_flags"]
+        report["patches"].append(entry)
 
     with open(output_dir / f"{cr3_path.stem}_report.json", "w") as f:
         json.dump(report, f, indent=2)
@@ -370,6 +463,33 @@ def parse_region_arg(region_arg: str):
         raise ValueError("--region must be 'x,y,w,h' or a path to a region file")
     x, y, w, h = (int(v) for v in parts)
     return "inline", (x, y, w, h), None
+
+
+def parse_manual_file(path_str: str):
+    """
+    Manual-slice file: lines '<CR3 name>, <x>, <y>'.
+    Returns dict name_lower -> list of (x, y). A frame may appear on
+    several lines (several manual slices).
+    """
+    p = Path(path_str)
+    if not p.is_file():
+        raise ValueError(f"manual slice file not found: {path_str}")
+    mapping = {}
+    with open(p, "r") as f:
+        for ln, line in enumerate(f, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [s.strip() for s in line.split(",")]
+            if len(parts) != 3:
+                raise ValueError(f"{p.name} line {ln}: expected "
+                                 f"'<name>, <x>, <y>', got: {line}")
+            name = parts[0].lower()
+            x, y = int(parts[1]), int(parts[2])
+            mapping.setdefault(name, []).append((x, y))
+    if not mapping:
+        raise ValueError(f"{p.name}: no manual slice lines found")
+    return mapping
 
 
 def write_data_file_out(output_dir: Path, entries: list):
@@ -449,9 +569,27 @@ def main():
     if args.card:
         region_mode, region_data, region_order = parse_region_arg(args.region)
 
+    # --- manual slices: auto-discover data_harvest.txt in the input folder --
+    manual_map = {}
+    manual_dir = target if target.is_dir() else target.parent
+    manual_path = manual_dir / MANUAL_FILE_NAME
+    if manual_path.is_file():
+        print(f"Manual slice file FOUND: {manual_path} -- its slices will be "
+              f"added to the automatic harvesting")
+        try:
+            manual_map = parse_manual_file(str(manual_path))
+        except ValueError as e:
+            print(f"  [ERROR] {e} -- manual slices skipped, "
+                  f"automatic harvesting continues")
+            manual_map = {}
+    else:
+        print(f"Manual slice file not found ({manual_path}) -- "
+              f"automatic harvesting only")
+
     current = None          # most recent successful card measurement
     out_entries = []        # rows for data_file_out.txt
     seen_names = set()
+    seen_manual = set()
 
     for f in files:
         wb = {"source": "as_shot", "measurement": None}
@@ -491,7 +629,18 @@ def main():
                 print(f"  [WARN] {f.name}: no card measured yet in sorted order; "
                       f"falling back to as-shot WB (silver tier)")
 
-        analyze_and_harvest(f, out_dir, args.png, args.size, wb)
+        key_m = f.name.lower()
+        points = manual_map.get(key_m)
+        if points:
+            seen_manual.add(key_m)
+        analyze_and_harvest(f, out_dir, args.png, args.size, wb,
+                            manual_points=points)
+
+    if manual_map:
+        for name in manual_map:
+            if name not in seen_manual:
+                print(f"  [WARN] {MANUAL_FILE_NAME} lists '{name}' "
+                      f"but no such CR3 was processed")
 
     if args.card:
         if region_mode == "file":
